@@ -1,0 +1,89 @@
+name: conventional-semver
+description: >-
+  Compute the next semantic version from Conventional Commits, update
+  CHANGELOG.md, tag, push, and create a GitHub Release - all in one step.
+author: conventional-semver contributors
+branding:
+  icon: tag
+  color: blue
+
+inputs:
+  github-token:
+    description: >-
+      Token used to push the release commit/tag and create the GitHub
+      Release. Needs `contents: write` permission.
+    required: true
+  tag-prefix:
+    description: Prefix for release tags.
+    required: false
+    default: v
+  changelog-file:
+    description: Path to the changelog file to prepend to.
+    required: false
+    default: CHANGELOG.md
+  create-github-release:
+    description: >-
+      Whether to create a GitHub Release via `gh release create` after
+      tagging. Set to 'false' if you only want the tag/changelog/push.
+    required: false
+    default: "true"
+
+outputs:
+  version:
+    description: The version that was released (empty if nothing was releasable).
+    value: ${{ steps.next.outputs.version }}
+  tag:
+    description: The tag that was created (empty if nothing was releasable).
+    value: ${{ steps.release.outputs.tag }}
+  released:
+    description: "'true' if a release was made, 'false' otherwise."
+    value: ${{ steps.release.outputs.released || 'false' }}
+
+runs:
+  using: composite
+  steps:
+    - id: next
+      shell: bash
+      run: |
+        set -euo pipefail
+        out_file="$RUNNER_TEMP/conventional-semver-version"
+        rm -f "$out_file"
+        "${{ github.action_path }}/bin/semver-next" \
+          --tag-prefix "${{ inputs.tag-prefix }}" \
+          --output-file "$out_file"
+        if [[ -s "$out_file" ]]; then
+          echo "version=$(cat "$out_file")" >>"$GITHUB_OUTPUT"
+        else
+          echo "version=" >>"$GITHUB_OUTPUT"
+        fi
+
+    - id: release
+      if: steps.next.outputs.version != ''
+      shell: bash
+      env:
+        GH_TOKEN: ${{ inputs.github-token }}
+        CREATE_GITHUB_RELEASE: ${{ inputs.create-github-release }}
+      run: |
+        set -euo pipefail
+        hook="$RUNNER_TEMP/conventional-semver-gh-release-hook.sh"
+        cat >"$hook" <<'HOOK'
+        #!/usr/bin/env bash
+        set -euo pipefail
+        if [[ "${CREATE_GITHUB_RELEASE}" == "true" ]]; then
+          gh release create "$SEMVER_TAG" --title "$SEMVER_TAG" --notes-file "$SEMVER_NOTES_FILE"
+        fi
+        HOOK
+        chmod +x "$hook"
+
+        "${{ github.action_path }}/bin/semver-release" \
+          --version "${{ steps.next.outputs.version }}" \
+          --tag-prefix "${{ inputs.tag-prefix }}" \
+          --changelog-file "${{ inputs.changelog-file }}" \
+          --commit-url-template "${{ github.server_url }}/${{ github.repository }}/commit/{sha}" \
+          --compare-url-template "${{ github.server_url }}/${{ github.repository }}/compare/{prev}...{new}" \
+          --remote "${{ github.server_url }}/${{ github.repository }}.git" \
+          --push-token "${{ inputs.github-token }}" \
+          --release-hook "$hook"
+
+        echo "tag=${{ inputs.tag-prefix }}${{ steps.next.outputs.version }}" >>"$GITHUB_OUTPUT"
+        echo "released=true" >>"$GITHUB_OUTPUT"

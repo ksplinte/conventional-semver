@@ -1,0 +1,122 @@
+#!/usr/bin/env bash
+#
+# commit-lint - validate commit subjects against the Conventional Commits spec.
+#
+# Usage:
+#   commit-lint --message <string>
+#   commit-lint --range <rev>..<rev>
+#
+# Options:
+#   --message <string>       Lint a single commit subject/body string.
+#   --range <rev>..<rev>     Lint every commit reachable in the given git range.
+#   --types <csv>            Comma-separated allowed types
+#                             (default: feat,fix,docs,style,refactor,perf,test,build,ci,chore,revert).
+#   --skip-pattern <regex>   Extended-regex subject pattern to skip (in addition
+#                             to merge commits), e.g. this tool's own release
+#                             commits. Default: ^chore\(release\):
+#   -h, --help                Show this help.
+#
+# Exit codes:
+#   0  all linted commits pass
+#   1  one or more commits failed linting
+#   2  usage error
+#
+# Nothing is written to stdout except on --help; all diagnostics go to stderr
+# so this tool composes cleanly in CI pipelines.
+
+set -euo pipefail
+
+PROG=$(basename "$0")
+
+log_err() { printf '%s: %s\n' "$PROG" "$*" >&2; }
+usage() { sed -n '3,20p' "$0" | sed 's/^# \{0,1\}//'; }
+
+DEFAULT_TYPES="feat,fix,docs,style,refactor,perf,test,build,ci,chore,revert"
+DEFAULT_SKIP_PATTERN='^chore\(release\):'
+
+message=""
+range=""
+types="$DEFAULT_TYPES"
+skip_pattern="$DEFAULT_SKIP_PATTERN"
+
+while [[ $# -gt 0 ]]; do
+	case "$1" in
+		--message)
+			message="${2:?--message requires a value}"
+			shift 2
+			;;
+		--range)
+			range="${2:?--range requires a value}"
+			shift 2
+			;;
+		--types)
+			types="${2:?--types requires a value}"
+			shift 2
+			;;
+		--skip-pattern)
+			skip_pattern="${2:?--skip-pattern requires a value}"
+			shift 2
+			;;
+		-h | --help)
+			usage
+			exit 0
+			;;
+		*)
+			log_err "unknown argument: $1"
+			exit 2
+			;;
+	esac
+done
+
+if [[ -z "$message" && -z "$range" ]]; then
+	log_err "one of --message or --range is required"
+	exit 2
+fi
+if [[ -n "$message" && -n "$range" ]]; then
+	log_err "--message and --range are mutually exclusive"
+	exit 2
+fi
+
+# type(scope)!: subject   -- scope and ! are both optional.
+type_alt=${types//,/|}
+CONVENTIONAL_RE="^(${type_alt})(\([a-z0-9./_-]+\))?!?: [^[:space:]].*[^[:space:].]$"
+
+lint_subject() {
+	local subject="$1" sha="${2:-}"
+	local label="${sha:+$sha }"
+
+	if [[ "$subject" =~ ^Merge\  ]]; then
+		return 0
+	fi
+	if [[ -n "$skip_pattern" && "$subject" =~ $skip_pattern ]]; then
+		return 0
+	fi
+	if [[ ! "$subject" =~ $CONVENTIONAL_RE ]]; then
+		log_err "${label}invalid subject: \"$subject\""
+		log_err "  expected: type(scope)!: subject   (type one of: ${types})"
+		return 1
+	fi
+	return 0
+}
+
+failures=0
+
+if [[ -n "$message" ]]; then
+	subject="${message%%$'\n'*}"
+	lint_subject "$subject" || failures=$((failures + 1))
+else
+	while IFS= read -r -d $'\x1e' record; do
+		record=${record#$'\n'}
+		[[ -z "$record" ]] && continue
+		sha=${record%%$'\x1f'*}
+		subject=${record#*$'\x1f'}
+		subject=${subject%%$'\n'*}
+		lint_subject "$subject" "$sha" || failures=$((failures + 1))
+	done < <(git log --format='%H%x1f%s%x1e' "$range")
+fi
+
+if [[ "$failures" -gt 0 ]]; then
+	log_err "$failures commit(s) failed linting"
+	exit 1
+fi
+exit 0

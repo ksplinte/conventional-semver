@@ -1,0 +1,244 @@
+#!/usr/bin/env bash
+#
+# semver-release - tag a release, update CHANGELOG.md, and push.
+#
+# Reads a bumped version (from --version or the file semver-next wrote),
+# builds grouped release notes from Conventional Commits since the previous
+# tag, prepends them to CHANGELOG.md, commits, tags, and pushes. Safe to
+# retry: if the tag already exists (locally or on the remote), it exits 0
+# without doing anything.
+#
+# Platform-specific steps (e.g. creating a GitHub/GitLab Release object) are
+# NOT built in - pass --release-hook to run an external script after the tag
+# is pushed. The hook receives SEMVER_VERSION, SEMVER_TAG, and
+# SEMVER_NOTES_FILE (path to a file containing just this release's notes) as
+# environment variables.
+#
+# Usage:
+#   semver-release [--version X.Y.Z] [options]
+#
+# Options:
+#   --version <X.Y.Z>          Version to release (default: read from
+#                               --version-file, bare, no prefix).
+#   --version-file <path>      Where to read the version from when --version
+#                               is not given (default: ./version).
+#   --tag-prefix <str>         Prefix for the git tag (default: v).
+#   --changelog-file <path>    Changelog to prepend to (default: CHANGELOG.md).
+#   --commit-url-template <t>  Template for per-commit links, {sha} placeholder,
+#                               e.g. https://github.com/OWNER/REPO/commit/{sha}
+#   --compare-url-template <t> Template for the release heading link, {prev}
+#                               and {new} placeholders (tag names), e.g.
+#                               https://github.com/OWNER/REPO/compare/{prev}...{new}
+#   --remote <name-or-url>     Git remote to push to (default: origin).
+#   --push-token <token>       If set and --remote is an https:// URL, injects
+#                               `x-access-token:<token>@` into it before pushing.
+#   --release-hook <path>      Executable run after a successful tag+push.
+#   --dry-run                  Compute and print everything; touch nothing on
+#                               disk, make no commits, no tags, no pushes.
+#   -h, --help                  Show this help.
+#
+# Exit codes:
+#   0  released (or already released - safe retry), or --dry-run completed
+#   1  release steps failed
+#   2  usage error
+
+set -euo pipefail
+
+PROG=$(basename "$0")
+
+log_info() { printf '%s: %s\n' "$PROG" "$*" >&2; }
+log_err() { printf '%s: %s\n' "$PROG" "$*" >&2; }
+usage() { sed -n '3,29p' "$0" | sed 's/^# \{0,1\}//'; }
+
+version=""
+version_file="./version"
+tag_prefix="v"
+changelog_file="CHANGELOG.md"
+commit_url_template=""
+compare_url_template=""
+remote="origin"
+push_token=""
+release_hook=""
+dry_run=0
+
+while [[ $# -gt 0 ]]; do
+	case "$1" in
+		--version)
+			version="${2:?--version requires a value}"
+			shift 2
+			;;
+		--version-file)
+			version_file="${2:?--version-file requires a value}"
+			shift 2
+			;;
+		--tag-prefix)
+			tag_prefix="${2:?--tag-prefix requires a value}"
+			shift 2
+			;;
+		--changelog-file)
+			changelog_file="${2:?--changelog-file requires a value}"
+			shift 2
+			;;
+		--commit-url-template)
+			commit_url_template="${2:?--commit-url-template requires a value}"
+			shift 2
+			;;
+		--compare-url-template)
+			compare_url_template="${2:?--compare-url-template requires a value}"
+			shift 2
+			;;
+		--remote)
+			remote="${2:?--remote requires a value}"
+			shift 2
+			;;
+		--push-token)
+			push_token="${2:?--push-token requires a value}"
+			shift 2
+			;;
+		--release-hook)
+			release_hook="${2:?--release-hook requires a value}"
+			shift 2
+			;;
+		--dry-run)
+			dry_run=1
+			shift
+			;;
+		-h | --help)
+			usage
+			exit 0
+			;;
+		*)
+			log_err "unknown argument: $1"
+			exit 2
+			;;
+	esac
+done
+
+if [[ -z "$version" ]]; then
+	if [[ ! -f "$version_file" ]]; then
+		log_err "no --version given and $version_file does not exist"
+		exit 2
+	fi
+	version=$(<"$version_file")
+fi
+if [[ -z "$version" ]]; then
+	log_err "empty version; nothing to release"
+	exit 2
+fi
+
+tag="${tag_prefix}${version}"
+
+# --- idempotency guard: safe to re-run on pipeline retry ---
+if [[ "$dry_run" -eq 1 ]]; then
+	if git rev-parse -q --verify "refs/tags/${tag}" >/dev/null; then
+		log_info "[dry-run] tag ${tag} already exists locally; would skip"
+		exit 0
+	fi
+else
+	if git ls-remote --exit-code --tags "$remote" "refs/tags/${tag}" >/dev/null 2>&1; then
+		log_info "tag ${tag} already exists on ${remote}; nothing to do"
+		exit 0
+	fi
+fi
+
+last_tag=$(git tag -l "${tag_prefix}*" --sort=-v:refname | head -n1 || true)
+range="HEAD"
+[[ -n "$last_tag" ]] && range="${last_tag}..HEAD"
+
+declare -a features=() fixes=() other=()
+
+url_for_commit() {
+	local sha="$1"
+	if [[ -n "$commit_url_template" ]]; then
+		echo "${commit_url_template//\{sha\}/$sha}"
+	fi
+}
+
+while IFS= read -r -d $'\x1e' record; do
+	record=${record#$'\n'}
+	[[ -z "$record" ]] && continue
+	IFS=$'\x1f' read -r sha subject <<<"$record"
+	[[ "$subject" =~ ^Merge\  ]] && continue
+	[[ "$subject" =~ ^chore\(release\): ]] && continue
+
+	short=${sha:0:7}
+	url=$(url_for_commit "$sha")
+	if [[ -n "$url" ]]; then
+		entry="* ${subject#*: } ([${short}](${url}))"
+	else
+		entry="* ${subject#*: } (${short})"
+	fi
+
+	case "$subject" in
+		feat*) features+=("$entry") ;;
+		fix*) fixes+=("$entry") ;;
+		*) other+=("$entry") ;;
+	esac
+done < <(git log --format='%H%x1f%s%x1e' "$range")
+
+today=$(date -u +%Y-%m-%d)
+
+if [[ -n "$last_tag" && -n "$compare_url_template" ]]; then
+	compare_url="${compare_url_template//\{prev\}/$last_tag}"
+	compare_url="${compare_url//\{new\}/$tag}"
+	heading="# [${version}](${compare_url}) (${today})"
+else
+	heading="# ${version} (${today})"
+fi
+
+notes_file=$(mktemp)
+trap 'rm -f "$notes_file"' EXIT
+
+{
+	echo "$heading"
+	if [[ "${#features[@]}" -gt 0 ]]; then
+		echo
+		echo "### Features"
+		printf '%s\n' "${features[@]}"
+	fi
+	if [[ "${#fixes[@]}" -gt 0 ]]; then
+		echo
+		echo "### Bug Fixes"
+		printf '%s\n' "${fixes[@]}"
+	fi
+	if [[ "${#other[@]}" -gt 0 ]]; then
+		echo
+		echo "### Other Changes"
+		printf '%s\n' "${other[@]}"
+	fi
+} >"$notes_file"
+
+if [[ "$dry_run" -eq 1 ]]; then
+	log_info "[dry-run] would tag ${tag} and prepend the following to ${changelog_file}:"
+	cat "$notes_file" >&2
+	exit 0
+fi
+
+# --- prepend to changelog ---
+tmp_changelog=$(mktemp)
+{
+	cat "$notes_file"
+	echo
+	[[ -f "$changelog_file" ]] && cat "$changelog_file"
+} >"$tmp_changelog"
+mv "$tmp_changelog" "$changelog_file"
+
+# --- commit, tag ---
+git add "$changelog_file"
+git commit -q -m "chore(release): ${version} [skip ci]"
+git tag -a "$tag" -m "$version"
+
+# --- push ---
+push_remote="$remote"
+if [[ -n "$push_token" && "$remote" == https://* ]]; then
+	push_remote="https://x-access-token:${push_token}@${remote#https://}"
+fi
+
+git push -q "$push_remote" HEAD:"$(git rev-parse --abbrev-ref HEAD)"
+git push -q "$push_remote" "$tag"
+
+log_info "released ${tag}"
+
+if [[ -n "$release_hook" ]]; then
+	SEMVER_VERSION="$version" SEMVER_TAG="$tag" SEMVER_NOTES_FILE="$notes_file" "$release_hook"
+fi

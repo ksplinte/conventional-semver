@@ -1,0 +1,150 @@
+#!/usr/bin/env bash
+#
+# semver-next - compute the next semantic version from Conventional Commits.
+#
+# Walks commits since the last matching tag, classifies each by conventional
+# type, and derives the version bump (breaking -> major, feat -> minor,
+# fix/perf/refactor/revert -> patch, everything else -> no bump). Pure: makes
+# no git-history changes, no network access.
+#
+# Usage:
+#   semver-next [--tag-prefix v] [--output-file ./version] [--print]
+#
+# Options:
+#   --tag-prefix <str>    Prefix of release tags to search for (default: v).
+#   --output-file <path>  Where to write the bare (no prefix) bumped version
+#                          (default: ./version). Only written when there IS a
+#                          releasable change - this is the load-bearing
+#                          contract consumers rely on to skip empty releases.
+#   --print               Print the version to stdout instead of writing a
+#                          file. Still prints nothing when there's no bump.
+#   -h, --help             Show this help.
+#
+# Exit codes:
+#   0  ran successfully (whether or not a bump was found)
+#   2  usage error
+
+set -euo pipefail
+
+PROG=$(basename "$0")
+
+log_info() { printf '%s: %s\n' "$PROG" "$*" >&2; }
+log_err() { printf '%s: %s\n' "$PROG" "$*" >&2; }
+usage() { sed -n '3,20p' "$0" | sed 's/^# \{0,1\}//'; }
+
+tag_prefix="v"
+output_file="./version"
+print_only=0
+
+while [[ $# -gt 0 ]]; do
+	case "$1" in
+		--tag-prefix)
+			tag_prefix="${2:?--tag-prefix requires a value}"
+			shift 2
+			;;
+		--output-file)
+			output_file="${2:?--output-file requires a value}"
+			shift 2
+			;;
+		--print)
+			print_only=1
+			shift
+			;;
+		-h | --help)
+			usage
+			exit 0
+			;;
+		*)
+			log_err "unknown argument: $1"
+			exit 2
+			;;
+	esac
+done
+
+last_tag=$(git tag -l "${tag_prefix}*" --sort=-v:refname | head -n1 || true)
+
+if [[ -n "$last_tag" ]]; then
+	range="${last_tag}..HEAD"
+	base_version="${last_tag#"$tag_prefix"}"
+else
+	range="HEAD"
+	base_version="0.0.0"
+fi
+
+IFS='.' read -r major minor patch <<<"$base_version"
+
+bump="none"
+raise_bump() {
+	# major > minor > patch > none
+	case "$1" in
+		major) bump="major" ;;
+		minor) [[ "$bump" == "major" ]] || bump="minor" ;;
+		patch) [[ "$bump" != "none" ]] || bump="patch" ;;
+	esac
+	return 0
+}
+
+classify_type() {
+	local type="$1" breaking="$2"
+	if [[ "$breaking" == "1" ]]; then
+		echo major
+		return
+	fi
+	case "$type" in
+		feat) echo minor ;;
+		fix | perf | refactor | revert) echo patch ;;
+		*) echo none ;;
+	esac
+}
+
+while IFS= read -r -d $'\x1e' record; do
+	record=${record#$'\n'}
+	[[ -z "$record" ]] && continue
+
+	IFS=$'\x1f' read -r _sha subject body <<<"$record"
+	[[ "$subject" =~ ^Merge\  ]] && continue
+
+	breaking=0
+	if [[ "$subject" =~ ^[a-z]+(\([a-z0-9./_-]+\))?\!: ]]; then
+		breaking=1
+	elif [[ "$body" == *"BREAKING CHANGE:"* || "$body" == *"BREAKING-CHANGE:"* ]]; then
+		breaking=1
+	fi
+
+	type=""
+	if [[ "$subject" =~ ^([a-z]+)(\([a-z0-9./_-]+\))?\!?: ]]; then
+		type="${BASH_REMATCH[1]}"
+	fi
+
+	level=$(classify_type "$type" "$breaking")
+	raise_bump "$level"
+done < <(git log --format='%H%x1f%s%x1f%b%x1e' "$range")
+
+if [[ "$bump" == "none" ]]; then
+	log_info "no releasable commits since ${last_tag:-the beginning of history}; nothing to do"
+	exit 0
+fi
+
+case "$bump" in
+	major)
+		major=$((major + 1))
+		minor=0
+		patch=0
+		;;
+	minor)
+		minor=$((minor + 1))
+		patch=0
+		;;
+	patch)
+		patch=$((patch + 1))
+		;;
+esac
+
+next_version="${major}.${minor}.${patch}"
+
+if [[ "$print_only" -eq 1 ]]; then
+	printf '%s\n' "$next_version"
+else
+	printf '%s' "$next_version" >"$output_file"
+	log_info "wrote ${next_version} to ${output_file} (bump: ${bump})"
+fi
